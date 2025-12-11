@@ -1,0 +1,397 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Base64.h>
+#include "esp_sleep.h"
+
+// ---------- ESP32-CAM AI-Thinker GPIO ----------
+#define PWDN_GPIO_NUM       32
+#define RESET_GPIO_NUM      -1
+#define XCLK_GPIO_NUM       0
+#define SIOD_GPIO_NUM       26
+#define SIOC_GPIO_NUM       27
+#define Y9_GPIO_NUM         35
+#define Y8_GPIO_NUM         34
+#define Y7_GPIO_NUM         39
+#define Y6_GPIO_NUM         36
+#define Y5_GPIO_NUM         21
+#define Y4_GPIO_NUM         19
+#define Y3_GPIO_NUM         18
+#define Y2_GPIO_NUM         5
+#define VSYNC_GPIO_NUM      25
+#define HREF_GPIO_NUM       23
+#define PCLK_GPIO_NUM       22
+#define FLASH_LED_PIN       4
+
+// ==========================================
+// 請在此處填寫您的 WiFi 與 MQTT 資訊 
+// ==========================================
+const char* ssid = "Ls Lab2";          // 請修改
+const char* password = "gs5g44332";  // 請修改
+
+const char* mqtt_broker = "broker.emqx.io";   // 請修改
+const int mqtt_port = 1883;
+const char* mqtt_username = "esp32cam_image"; // 請修改
+const char* mqtt_password = "esp32cam_image"; // 請修改
+
+// ---------- MQTT Topics ----------
+const char* mqtt_topic_info = "esp32/camera/info";
+const char* mqtt_topic_data = "esp32/camera/data";
+const char* mqtt_topic_complete = "esp32/camera/complete";
+const char* mqtt_status_topic = "esp32/camera/status";
+const char* mqtt_cmd_topic = "esp32/camera/cmd";       // 握手指令
+const char* mqtt_chunk_ack = "esp32/camera/chunk_ack"; // 分段確認
+
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient);
+
+// 拍照間隔（秒）
+const unsigned long photoInterval = 600; // 1 分鐘
+
+// 流程控制旗標與超時設定
+bool waitingForOK = false;
+unsigned long okWaitStart = 0;
+const unsigned long okTimeout = 45000; // 握手超時
+
+volatile bool chunkAckReceived = false;
+const unsigned long chunkTimeout = 10000; // ACK 超時
+const int maxChunkRetries = 5; 
+const int maxPhotoRetries = 3; 
+
+// ------------------- 函數宣告 -------------------
+void setupCamera();
+void setupWiFi();
+void connectToMQTT();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+bool sendImageChunks(String imageId, String &imageBase64);
+bool captureAndSendPhoto();
+void executePhotoTask();
+
+
+// ------------------- 相機初始化與配置 -------------------
+void setupCamera() {
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = Y2_GPIO_NUM; 
+    config.pin_d1 = Y3_GPIO_NUM; 
+    config.pin_d2 = Y4_GPIO_NUM; 
+    config.pin_d3 = Y5_GPIO_NUM; 
+    config.pin_d4 = Y6_GPIO_NUM; 
+    config.pin_d5 = Y7_GPIO_NUM; 
+    config.pin_d6 = Y8_GPIO_NUM; 
+    config.pin_d7 = Y9_GPIO_NUM; 
+    config.pin_xclk = XCLK_GPIO_NUM; 
+    config.pin_pclk = PCLK_GPIO_NUM; 
+    config.pin_vsync = VSYNC_GPIO_NUM; 
+    config.pin_href = HREF_GPIO_NUM; 
+    config.pin_sccb_sda = SIOD_GPIO_NUM; 
+    config.pin_sccb_scl = SIOC_GPIO_NUM; 
+    config.pin_pwdn = PWDN_GPIO_NUM; 
+    config.pin_reset = RESET_GPIO_NUM; 
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_JPEG;
+    
+    // 解析度設定：使用 VGA (640x480) 平衡畫質與傳輸穩定性
+    // 若使用 QVGA (320x240) 雖然與截圖相同，但畫面太小不實用
+    config.frame_size = FRAMESIZE_VGA; 
+    
+    // 畫質設定：保持 20 以確保 MQTT 不會因為封包過大而失敗
+    // (截圖中的 Quality 4 檔案過大，不適合 MQTT)
+    config.jpeg_quality = 20;
+    
+    config.fb_count = 2; // 雙緩衝區
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    
+    if (!psramFound()) {
+        config.frame_size = FRAMESIZE_QVGA;
+        config.fb_location = CAMERA_FB_IN_DRAM;
+    }
+
+    // 執行初始化
+    if (esp_camera_init(&config) != ESP_OK) {
+        Serial.println("Camera init failed!");
+        return; 
+    }
+    
+    // =========================================================
+    // 📷 傳感器參數設定 (完全依照您的 CameraWebServer 截圖設定)
+    // =========================================================
+    Serial.println("Camera initialized! Applying settings from screenshot...");
+
+    sensor_t * s = esp_camera_sensor_get();
+    if (s) {
+        // 1. 基礎色彩 (截圖皆為 0)
+        s->set_brightness(s, 0);
+        s->set_contrast(s, 0);
+        s->set_saturation(s, 0);
+        s->set_special_effect(s, 0); // No Effect
+
+        // 2. 自動白平衡 (截圖: AWB=ON, AWB Gain=ON, Mode=Auto)
+        s->set_whitebal(s, 1);    // 啟用自動白平衡
+        s->set_awb_gain(s, 1);    // 啟用白平衡增益
+        s->set_wb_mode(s, 0);     // 0 = Auto
+
+        // 3. 自動曝光與增益 (截圖: AEC SENSOR=ON, AE Level=0, AGC=ON)
+        s->set_exposure_ctrl(s, 1); // 啟用自動曝光
+        s->set_aec2(s, 0);          // 截圖中 AEC DSP 是關閉的
+        s->set_ae_level(s, 0);      // 曝光補償 0
+        s->set_gain_ctrl(s, 1);     // 啟用自動增益
+
+        // 4. 進階影像處理 (依照截圖開關)
+        s->set_bpc(s, 0);           // BPC 關閉
+        s->set_wpc(s, 1);           // WPC 開啟 (壞點修正)
+        s->set_raw_gma(s, 1);       // Raw GMA 開啟 (Gamma 校正)
+        s->set_lenc(s, 1);          // Lens Correction 開啟 (鏡頭校正)
+        s->set_dcw(s, 1);           // DCW 開啟 (縮放演算法)
+
+        // 5. 方向設定 (截圖中 V-Flip 是關閉的)
+        s->set_vflip(s, 0);         
+        s->set_hmirror(s, 0);       
+
+        // 特殊修正：如果是 OV3660 傳感器，通常物理上需要翻轉
+        if (s->id.PID == OV3660_PID) {
+             s->set_vflip(s, 1);
+        }
+
+        Serial.println("Sensor configuration complete (Auto Mode).");
+    }
+}
+
+// ------------------- Wi-Fi 連線 -------------------
+void setupWiFi() {
+    if (WiFi.status() == WL_CONNECTED) return;
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting Wi-Fi...");
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+        delay(500);
+        Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWi-Fi connected!");
+    } else {
+        Serial.println("\nWi-Fi connect failed!");
+    }
+}
+
+// ------------------- MQTT 回調函數 -------------------
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    String msg;
+    for (int i = 0; i < length; i++) msg += (char)payload[i];
+    
+    // 處理握手確認
+    if (String(topic) == mqtt_cmd_topic && msg == "ok") {
+        waitingForOK = false;
+        Serial.println("Received OK from Python!");
+    }
+    
+    // 處理分段確認
+    if (String(topic) == mqtt_chunk_ack && msg == "CHUNK_ACK") {
+        chunkAckReceived = true;
+    }
+}
+
+// ------------------- MQTT 連線與訂閱 -------------------
+void connectToMQTT() {
+    mqtt_client.setServer(mqtt_broker, mqtt_port);
+    mqtt_client.setCallback(mqttCallback);
+    mqtt_client.setBufferSize(8192); // 加大緩衝區
+    
+    if (mqtt_client.connected()) return;
+
+    unsigned long start = millis();
+    while (!mqtt_client.connected() && millis() - start < 15000) {
+        String clientId = "ESP32CAM-" + String(random(0xffff), HEX);
+        Serial.print("Connecting MQTT...");
+        if (mqtt_client.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
+            Serial.println("Connected!");
+            
+            // 發送上線狀態
+            mqtt_client.publish(mqtt_status_topic, "ESP32-CAM Online", true); 
+            
+            mqtt_client.subscribe(mqtt_cmd_topic);
+            mqtt_client.subscribe(mqtt_chunk_ack); 
+            return;
+        } else {
+            Serial.print("failed, rc="); Serial.println(mqtt_client.state());
+            delay(2000);
+        }
+    }
+}
+
+// ------------------- 分段傳送與重試 -------------------
+bool sendImageChunks(String imageId, String &imageBase64) {
+    const int maxChunkSize = 700; // 每個分段大小
+    int totalChunks = (imageBase64.length() + maxChunkSize - 1) / maxChunkSize;
+
+    Serial.printf("Sending image %s in %d chunks...\n", imageId.c_str(), totalChunks);
+
+    for (int i = 0; i < totalChunks; i++) {
+        int currentRetries = 0;
+        bool chunkSent = false;
+        
+        int startPos = i * maxChunkSize;
+        int chunkSize = min(maxChunkSize, (int)(imageBase64.length() - startPos));
+        String chunk = imageBase64.substring(startPos, startPos + chunkSize);
+        
+        // 構建 JSON 
+        const int JSON_MAX_SIZE = 1200; 
+        char chunkJson[JSON_MAX_SIZE];
+        snprintf(chunkJson, JSON_MAX_SIZE, 
+                 "{\"id\":\"%s\",\"chunk\":%d,\"total\":%d,\"data\":\"%s\"}", 
+                 imageId.c_str(), i, totalChunks, chunk.c_str());
+
+        while (currentRetries < maxChunkRetries && !chunkSent) {
+            // 發送
+            if (mqtt_client.publish(mqtt_topic_data, chunkJson, false)) {
+                // 等待 ACK
+                chunkAckReceived = false;
+                unsigned long chunkWaitStart = millis();
+                while (!chunkAckReceived && millis() - chunkWaitStart < chunkTimeout) {
+                    mqtt_client.loop(); 
+                    delay(10);
+                }
+                if (chunkAckReceived) {
+                    chunkSent = true;
+                } else {
+                    currentRetries++;
+                    Serial.printf("Chunk %d ACK timeout. Retrying...\n", i);
+                }
+            } else {
+                if (!mqtt_client.connected()) connectToMQTT();
+                currentRetries++;
+                delay(100);
+            }
+        }
+        
+        if (!chunkSent) {
+            Serial.println("FATAL: Chunk transfer failed.");
+            return false;
+        }
+    }
+
+    // 發送完成訊號
+    String completeMsg = "{\"id\":\"" + imageId + "\",\"status\":\"complete\",\"chunks\":" + String(totalChunks) + "}";
+    mqtt_client.publish(mqtt_topic_complete, completeMsg.c_str(), true); 
+    mqtt_client.loop();
+    
+    return true; 
+}
+
+// ------------------- 拍照並傳送 (修正版：加入暖機) -------------------
+bool captureAndSendPhoto() {
+    Serial.println("Preparing to take photo...");
+    
+    // 1. 開啟閃光燈
+    pinMode(FLASH_LED_PIN, OUTPUT);
+    digitalWrite(FLASH_LED_PIN, HIGH);
+    
+    // 2. 關鍵修正：暖機流程 (Warm-up)
+    // 讓相機連續抓取並丟棄前幾幀畫面，讓 AWB (白平衡) 和 AEC (曝光) 有時間收斂
+    // 建議至少丟棄 3-5 幀，越多顏色越準，但耗電會稍微增加
+    Serial.print("Warming up camera...");
+    for (int i = 0; i < 4; i++) {
+        camera_fb_t * temp_fb = esp_camera_fb_get();
+        if (temp_fb) {
+            esp_camera_fb_return(temp_fb); // 讀取後馬上釋放，不傳送
+            Serial.print(".");
+        }
+        delay(1000); // 稍微間隔，給感光元件運算時間
+    }
+    Serial.println(" Done!");
+
+    // 3. 拍攝真正要傳送的照片
+    Serial.println("Taking FINAL photo...");
+    camera_fb_t * fb = esp_camera_fb_get();
+    
+    // 拍照完成，立刻關燈 (省電)
+    digitalWrite(FLASH_LED_PIN, LOW);
+
+    if (!fb) {
+        Serial.println("Camera capture failed!");
+        return false;
+    }
+
+    // --- 以下保持原本的傳送邏輯 ---
+    String imageId = String(millis()) + "_" + String(random(1000));
+    String imageBase64 = base64::encode(fb->buf, fb->len);
+
+    String info = "{\"id\":\"" + imageId + "\",\"timestamp\":" + String(millis()) +
+                  ",\"original_size\":" + String(fb->len) +
+                  ",\"base64_size\":" + String(imageBase64.length()) +
+                  ",\"format\":\"jpeg\",\"encoding\":\"base64\"}";
+
+    mqtt_client.publish(mqtt_topic_info, info.c_str(), true);
+    mqtt_client.loop();
+
+    bool transferSuccess = sendImageChunks(imageId, imageBase64);
+    
+    esp_camera_fb_return(fb); // 釋放記憶體
+    return transferSuccess;
+}
+// ------------------- 任務執行者 -------------------
+void executePhotoTask() {
+    setupWiFi();
+    connectToMQTT();
+
+    if (WiFi.status() != WL_CONNECTED || !mqtt_client.connected()) {
+        Serial.println("Network failed. Skipping task.");
+        return;
+    }
+
+    bool photoTaskSucceeded = false;
+    int currentPhotoRetries = 0;
+    
+    while (!photoTaskSucceeded && currentPhotoRetries < maxPhotoRetries) {
+        // 發送狀態並等待 Python 端回應 OK (握手)
+        waitingForOK = true;
+        mqtt_client.publish(mqtt_status_topic, "ESP32-CAM Online", true);
+        
+        unsigned long okWaitStart = millis();
+        Serial.println("Waiting for Handshake...");
+        
+        while (waitingForOK && millis() - okWaitStart < okTimeout) {
+            mqtt_client.loop();
+            delay(10);
+        }
+
+        if (!waitingForOK) { 
+            photoTaskSucceeded = captureAndSendPhoto(); 
+        } else {
+            Serial.println("Handshake timeout.");
+        }
+        
+        if (!photoTaskSucceeded) {
+            currentPhotoRetries++;
+            delay(2000);
+        }
+    }
+
+    if (photoTaskSucceeded) Serial.println("--- Task SUCCESS ---");
+    else Serial.println("--- Task FAILED ---");
+}
+
+// ------------------- Setup -------------------
+void setup() {
+    Serial.begin(115200);
+    Serial.println("--- Starting Setup ---"); 
+    randomSeed(analogRead(0)); 
+    
+    setupCamera(); // 設定相機參數
+    
+    // 執行一次任務
+    executePhotoTask();
+
+    // 進入睡眠
+    Serial.printf("Sleeping for %lu seconds...\n", photoInterval);
+    esp_sleep_enable_timer_wakeup(photoInterval * 1000000ULL);
+    delay(100);
+    esp_deep_sleep_start(); // 改用 Deep Sleep 更省電，醒來會重跑 setup
+}
+
+void loop() {
+    // Deep Sleep 模式下不會執行到這裡
+}
