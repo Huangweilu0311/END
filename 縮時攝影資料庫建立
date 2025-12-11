@@ -1,0 +1,25 @@
+-- 1. 建立資料庫 (名稱必須為 cam，對應 Python 的 DB_CONFIG)
+CREATE DATABASE IF NOT EXISTS cam;
+USE cam;
+
+-- 2. 建立 cam_info 表 (對應 insert_image_info 函式)
+CREATE TABLE IF NOT EXISTS cam_info (
+    sys_id INT AUTO_INCREMENT PRIMARY KEY,
+    timestamp DATETIME,            -- Python 傳入的是字串時間
+    image_id VARCHAR(100),         -- 圖片唯一 ID
+    filename VARCHAR(255),         -- 還原後的檔案名稱
+    size INT                       -- 原始大小
+);
+
+-- 3. 建立 cam_data 表 (對應 insert_image_chunk 函式)
+CREATE TABLE IF NOT EXISTS cam_data (
+    sys_id INT AUTO_INCREMENT PRIMARY KEY,
+    timestamp DATETIME,
+    image_id VARCHAR(100),         -- 關聯 ID
+    chunk_index INT,               -- 第幾段
+    total_chunks INT,              -- 總段數
+    data LONGTEXT,                 -- Base64 分段數據 (使用 LONGTEXT 防止截斷)
+    
+    -- 建立索引加速還原時的查詢速度
+    INDEX idx_img_id (image_id)
+);
