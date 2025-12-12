@@ -1,0 +1,264 @@
+import paho.mqtt.client as mqtt
+import pymysql
+import json
+import random  
+from datetime import datetime
+import threading
+import time
+import base64
+import os
+import sys
+from fastapi import FastAPI, Response
+import uvicorn
+
+# ==========================================
+# 1. 設定區域 (Configuration)
+# ==========================================
+
+UNIQUE_ID = "LSLab_User_888" 
+
+# 資料庫設定
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "123456",        
+    "database": "cam_2025_12_12_START",
+    "autocommit": True           
+}
+
+# MQTT 設定
+MQTT_BROKER = "broker.emqx.io" 
+MQTT_PORT = 1883
+
+# Topics
+TOPIC_STATUS = f"{UNIQUE_ID}/camera/status"       
+TOPIC_CMD = f"{UNIQUE_ID}/camera/cmd"            
+TOPIC_CHUNK_ACK = f"{UNIQUE_ID}/camera/chunk_ack" 
+TOPIC_IMAGE_INFO = f"{UNIQUE_ID}/camera/info"
+TOPIC_IMAGE_DATA = f"{UNIQUE_ID}/camera/data"
+TOPIC_IMAGE_COMPLETE = f"{UNIQUE_ID}/camera/complete"
+TOPIC_SENSOR_DATA = f"{UNIQUE_ID}/sensor/data"
+
+current_processing_id = None 
+
+# 建立 FastAPI App
+app = FastAPI()
+
+# ==========================================
+# 2. 資料庫操作函式 (寫入與讀取)
+# ==========================================
+
+def get_db_connection():
+    return pymysql.connect(**DB_CONFIG)
+
+# --- 原有的寫入函式 (保持不變) ---
+def insert_sensor_data(r, g, b, c, temp, hum):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        sql = """
+            INSERT INTO sensor_log (r_val, g_val, b_val, c_val, temperature, humidity) 
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        cursor.execute(sql, (r, g, b, c, temp, hum))
+        print(f"[Sensor] Saved: Temp={temp:.1f}, Hum={hum:.1f}")
+    except Exception as e:
+        print(f"[DB Error] Sensor insert failed: {e}")
+    finally:
+        if conn: conn.close()
+
+def insert_image_info(image_id, size, filename=None):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        sql = "INSERT INTO cam_info (image_id, filename, size) VALUES (%s,%s,%s)"
+        cursor.execute(sql, (image_id, filename, size))
+        print(f"[Image] Info saved: id={image_id}")
+    except Exception as e:
+        print(f"[DB Error] Image info insert failed: {e}")
+    finally:
+        if conn: conn.close()
+
+def insert_image_chunk(image_id, chunk_index, total_chunks, data):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        sql = "INSERT INTO cam_data (image_id, chunk_index, total_chunks, data) VALUES (%s,%s,%s,%s)"
+        cursor.execute(sql, (image_id, chunk_index, total_chunks, data))
+    except Exception as e:
+        raise Exception(f"Chunk insert failed: {e}")
+    finally:
+        if conn: conn.close()
+
+# --- 新增：給 API 用的讀取函式 ---
+
+def get_latest_sensor_from_db():
+    """從資料庫讀取最新的一筆感測器數據"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        # 使用 DictCursor 讓回傳結果變成字典格式 (JSON 友善)
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        # 假設你的資料庫有 id 或 timestamp 欄位，這裡用 id 排序取最新
+        sql = "SELECT * FROM sensor_log ORDER BY sys_id DESC LIMIT 1"
+        cursor.execute(sql)
+        return cursor.fetchone()
+    except Exception as e:
+        print(f"[DB Read Error] {e}")
+        return None
+    finally:
+        if conn: conn.close()
+
+
+def get_latest_image_bytes_from_db():
+    """從資料庫讀取最新的一張完整圖片，並轉回 bytes"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # 1. 先找最新的一張圖片 ID (假設 cam_info 有 id 自動遞增主鍵)
+        sql_id = "SELECT image_id FROM cam_info ORDER BY sys_id DESC LIMIT 1"
+        cursor.execute(sql_id)
+        row = cursor.fetchone()
+        if not row: return None
+        
+        image_id = row[0]
+        
+        # 2. 撈出該 ID 的所有碎片
+        sql_chunks = "SELECT data FROM cam_data WHERE image_id=%s ORDER BY chunk_index ASC"
+        cursor.execute(sql_chunks, (image_id,))
+        chunk_rows = cursor.fetchall()
+        
+        if not chunk_rows: return None
+        
+        # 3. 組合 Base64 並解碼
+        full_b64 = "".join([r[0].strip() for r in chunk_rows])
+        img_bytes = base64.b64decode(full_b64)
+        
+        return img_bytes
+    except Exception as e:
+        print(f"[DB Read Error] {e}")
+        return None
+    finally:
+        if conn: conn.close()
+
+# ==========================================
+# 3. MQTT 回呼函式 (保持不變)
+# ==========================================
+def on_connect(client, userdata, flags, rc, properties=None):
+    if rc == 0:
+        print(f"MQTT Connected. Listening to {UNIQUE_ID}...")
+        topics = [
+            (TOPIC_STATUS, 0), (TOPIC_IMAGE_INFO, 0), 
+            (TOPIC_IMAGE_DATA, 0), (TOPIC_IMAGE_COMPLETE, 0),
+            (TOPIC_SENSOR_DATA, 0)
+        ]
+        client.subscribe(topics)
+    else:
+        print(f"MQTT Connection Failed: {rc}")
+
+def on_message(client, userdata, msg):
+    global current_processing_id
+    try:
+        payload = msg.payload.decode()
+        
+        if msg.topic == TOPIC_STATUS:
+            print(f"\n[Status] Device Handshake: {payload}")
+            current_processing_id = None
+            client.publish(TOPIC_CMD, "ok", qos=0)
+            return
+
+        data = json.loads(payload)
+
+        if msg.topic == TOPIC_SENSOR_DATA:
+            insert_sensor_data(
+                data.get("R", 0), data.get("G", 0), data.get("B", 0), data.get("C", 0),
+                data.get("Temp", 0.0), data.get("Hum", 0.0)
+            )
+
+        elif msg.topic == TOPIC_IMAGE_INFO:
+            image_id = data.get("id")
+            size = data.get("original_size")
+            current_processing_id = image_id
+            print(f"\n[Start] Receiving Image: {image_id}")
+            if image_id: insert_image_info(image_id, size)
+
+        elif msg.topic == TOPIC_IMAGE_DATA:
+            image_id = data.get("id")
+            chunk_idx = data.get("chunk")
+            total = data.get("total")
+            b64_data = data.get("data")
+            insert_image_chunk(image_id, chunk_idx, total, b64_data)
+            client.publish(TOPIC_CHUNK_ACK, "CHUNK_ACK", qos=0)
+            # print(f".", end="", flush=True) # 簡化輸出
+
+        elif msg.topic == TOPIC_IMAGE_COMPLETE:
+            image_id = data.get("id")
+            print(f"\n[Complete] Image Saved to DB. ID: {image_id}")
+            current_processing_id = None
+
+    except Exception as e:
+        print(f"[Error] {e}")
+
+# ==========================================
+# 4. API 路由設定 (新增的部分)
+# ==========================================
+
+@app.get("/")
+def root():
+    return {"message": "ESP32-CAM IoT Server Running", "status": "active"}
+
+@app.get("/api/sensor/latest")
+def get_sensor_data():
+    data = get_latest_sensor_from_db()
+    if data:
+        return data
+    return {"error": "No sensor data found"}
+
+@app.get("/api/image/latest")
+def get_latest_image():
+    img_bytes = get_latest_image_bytes_from_db()
+    if img_bytes:
+        # 直接回傳圖片串流，瀏覽器會把它當成圖片顯示
+        return Response(content=img_bytes, media_type="image/jpeg")
+    return {"error": "No image data found"}
+
+# ==========================================
+# 5. 主程式 (啟動雙引擎)
+# ==========================================
+
+def start_mqtt_client():
+    client_id = f"PyReceiver-{random.randint(1, 10000)}"
+    client = mqtt.Client(client_id=client_id, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    
+    while True:
+        try:
+            print(f"Connecting to MQTT Broker...")
+            client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            client.loop_forever()
+        except Exception as e:
+            print(f"MQTT Connection Error: {e}, retrying in 5s...")
+            time.sleep(5)
+
+if __name__ == '__main__':
+    # 1. 啟動 MQTT (背景執行)
+    mqtt_thread = threading.Thread(target=start_mqtt_client)
+    mqtt_thread.daemon = True
+    mqtt_thread.start()
+    
+    print("------------------------------------------------")
+    print(">>> 系統啟動成功 <<<")
+    print("1. MQTT 接收中 (背景)")
+    print("2. API Server 啟動中...")
+    print("請打開瀏覽器訪問: http://127.0.0.1:8000/api/image/latest")
+    print("------------------------------------------------")
+
+    # 2. 啟動 Web Server (主執行緒)
+    # host="0.0.0.0" 代表允許區網內其他電腦連線
+    uvicorn.run(app, host="0.0.0.0", port=8000)
