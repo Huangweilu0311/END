@@ -1,25 +1,58 @@
--- 1. 建立資料庫 (名稱必須為 cam，對應 Python 的 DB_CONFIG)
-CREATE DATABASE IF NOT EXISTS cam;
-USE cam;
+-- 1. 建立資料庫
+CREATE DATABASE IF NOT EXISTS cam_2025_12_12_START;
+USE cam_2025_12_12_START;
 
--- 2. 建立 cam_info 表 (對應 insert_image_info 函式)
+-- 2. 建立 cam_info 表 (圖片資訊)
 CREATE TABLE IF NOT EXISTS cam_info (
     sys_id INT AUTO_INCREMENT PRIMARY KEY,
-    timestamp DATETIME,            -- Python 傳入的是字串時間
+    
+    -- ★修改：加入 DEFAULT CURRENT_TIMESTAMP，Python 不用再傳時間了
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, 
+    
     image_id VARCHAR(100),         -- 圖片唯一 ID
     filename VARCHAR(255),         -- 還原後的檔案名稱
     size INT                       -- 原始大小
 );
 
--- 3. 建立 cam_data 表 (對應 insert_image_chunk 函式)
+-- 3. 建立 cam_data 表 (圖片分段數據)
 CREATE TABLE IF NOT EXISTS cam_data (
     sys_id INT AUTO_INCREMENT PRIMARY KEY,
-    timestamp DATETIME,
+    
+    -- ★修改：加入 DEFAULT CURRENT_TIMESTAMP
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    
     image_id VARCHAR(100),         -- 關聯 ID
     chunk_index INT,               -- 第幾段
     total_chunks INT,              -- 總段數
-    data LONGTEXT,                 -- Base64 分段數據 (使用 LONGTEXT 防止截斷)
+    data LONGTEXT,                 -- Base64 分段數據
     
-    -- 建立索引加速還原時的查詢速度
+    -- 建立索引
     INDEX idx_img_id (image_id)
 );
+
+-- 4. 建立 sensor_log 表 (感測器數據)
+CREATE TABLE IF NOT EXISTS sensor_log (
+    sys_id INT AUTO_INCREMENT PRIMARY KEY,
+    
+    -- 顏色數據 (TCS34725)
+    r_val INT,
+    g_val INT,
+    b_val INT,
+    c_val INT,
+    
+    -- 溫濕度數據 (DHT22)
+    temperature FLOAT,
+    humidity FLOAT,
+    
+    -- ★修改：這裡原本就正確，保持不變
+    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 查看最新的 5 張圖片資訊
+SELECT * FROM cam_info 
+ORDER BY timestamp DESC 
+LIMIT 20;
+
+
+SELECT * FROM sensor_log 
+LIMIT 20;
