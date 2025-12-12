@@ -25,9 +25,10 @@
 
 // ==========================================
 // 請在此處填寫您的 WiFi 與 MQTT 資訊 
+
 // ==========================================
-const char* ssid = "Ls Lab2";          // 請修改
-const char* password = "gs5g44332";  // 請修改
+const char* ssid = "LS Lab2";          // 請修改
+const char* password = "gs5g4432";  // 請修改
 
 const char* mqtt_broker = "broker.emqx.io";   // 請修改
 const int mqtt_port = 1883;
@@ -46,7 +47,7 @@ WiFiClient espClient;
 PubSubClient mqtt_client(espClient);
 
 // 拍照間隔（秒）
-const unsigned long photoInterval = 600; // 1 分鐘
+const unsigned long photoInterval = 600; // 10 分鐘
 
 // 流程控制旗標與超時設定
 bool waitingForOK = false;
@@ -98,7 +99,7 @@ void setupCamera() {
     
     // 畫質設定：保持 20 以確保 MQTT 不會因為封包過大而失敗
     // (截圖中的 Quality 4 檔案過大，不適合 MQTT)
-    config.jpeg_quality = 20;
+    config.jpeg_quality = 30;
     
     config.fb_count = 2; // 雙緩衝區
     config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -291,15 +292,16 @@ bool captureAndSendPhoto() {
     
     // 2. 關鍵修正：暖機流程 (Warm-up)
     // 讓相機連續抓取並丟棄前幾幀畫面，讓 AWB (白平衡) 和 AEC (曝光) 有時間收斂
-    // 建議至少丟棄 3-5 幀，越多顏色越準，但耗電會稍微增加
+   
     Serial.print("Warming up camera...");
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 2; i++) {
         camera_fb_t * temp_fb = esp_camera_fb_get();
         if (temp_fb) {
             esp_camera_fb_return(temp_fb); // 讀取後馬上釋放，不傳送
+            delay(100);
             Serial.print(".");
         }
-        delay(1000); // 稍微間隔，給感光元件運算時間
+        delay(80); // 稍微間隔，給感光元件運算時間
     }
     Serial.println(" Done!");
 
