@@ -35,18 +35,18 @@ const char* mqtt_username = "esp32cam_image";
 const char* mqtt_password = "esp32cam_image"; 
 
 // ---------- MQTT Topics ----------
-const char* mqtt_topic_info = "esp32/camera/info";
-const char* mqtt_topic_data = "esp32/camera/data";
-const char* mqtt_topic_complete = "esp32/camera/complete";
-const char* mqtt_status_topic = "esp32/camera/status";
-const char* mqtt_cmd_topic = "esp32/camera/cmd";       // 握手指令
-const char* mqtt_chunk_ack = "esp32/camera/chunk_ack"; // 分段確認
+const char* mqtt_topic_info = "LSLab_User_888/camera/info";
+const char* mqtt_topic_data = "LSLab_User_888/camera/data";
+const char* mqtt_topic_complete = "LSLab_User_888/camera/complete";
+const char* mqtt_status_topic = "LSLab_User_888/camera/status";
+const char* mqtt_cmd_topic = "LSLab_User_888/camera/cmd";       // 握手指令
+const char* mqtt_chunk_ack = "LSLab_User_888/camera/chunk_ack"; // 分段確認
 
 WiFiClient espClient;
 PubSubClient mqtt_client(espClient);
 
 // 拍照間隔（秒）
-const unsigned long photoInterval = 600; // 10 分鐘
+const unsigned long photoInterval = 300; // 5 分鐘
 
 // 流程控制旗標與超時設定
 volatile bool waitingForOK = false;
@@ -92,7 +92,7 @@ void setupCamera() {
     
     // 使用 VGA 取得較好的平衡
     config.frame_size = FRAMESIZE_VGA; 
-    config.jpeg_quality = 30;
+    config.jpeg_quality = 25;
     config.fb_count = 2; 
     config.fb_location = CAMERA_FB_IN_PSRAM;
     config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
@@ -241,7 +241,7 @@ bool sendImageChunks(String imageId, String &imageBase64) {
 bool captureAndSendPhoto() {
     Serial.println("\nWarming up camera...");
     pinMode(FLASH_LED_PIN, OUTPUT);
-    // digitalWrite(FLASH_LED_PIN, HIGH); // 需要補光請取消註解
+    digitalWrite(FLASH_LED_PIN, HIGH); // 需要補光請取消註解
     
     // 暖機：丟棄前兩張以穩定白平衡
     for (int i = 0; i < 2; i++) {
