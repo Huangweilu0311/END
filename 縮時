@@ -1,0 +1,133 @@
+import cv2
+import numpy as np
+import pymysql
+import base64
+import time
+from tqdm import tqdm  # 進度條
+
+# ==========================================
+# 1. 設定區域
+# ==========================================
+
+# 資料庫設定 (請確認與你原本的設定一致)
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "123456",
+    "database": "cam_2025_12_12_START",
+    "autocommit": True
+}
+
+# 影片設定
+OUTPUT_FILENAME = "timelapse_video.mp4" # 輸出的檔名
+FPS = 10  # 每秒幾張圖 (數值越大，影片速度越快)
+# 例如：如果你每 5 分鐘拍一張，設定 FPS=10，代表 1 秒鐘會播放過去 50 分鐘的變化
+
+# ==========================================
+# 2. 函式定義
+# ==========================================
+
+def get_db_connection():
+    return pymysql.connect(**DB_CONFIG)
+
+def get_all_image_ids():
+    """取得所有圖片的 ID，並依照時間(sys_id)排序"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            # 依照 sys_id 排序，確保縮時攝影的時間軸是正確的
+            sql = "SELECT image_id FROM cam_info ORDER BY sys_id ASC"
+            cursor.execute(sql)
+            results = cursor.fetchall()
+            return [row[0] for row in results]
+    finally:
+        conn.close()
+
+def get_image_bytes(image_id):
+    """從資料庫撈出碎片並重組成 bytes"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            sql = "SELECT data FROM cam_data WHERE image_id=%s ORDER BY chunk_index ASC"
+            cursor.execute(sql, (image_id,))
+            rows = cursor.fetchall()
+            
+            if not rows:
+                return None
+            
+            # 組合 Base64 字串
+            full_b64 = "".join([row[0].strip() for row in rows])
+            
+            # 解碼成 Bytes
+            return base64.b64decode(full_b64)
+    except Exception as e:
+        print(f"Error reading image {image_id}: {e}")
+        return None
+    finally:
+        conn.close()
+
+def bytes_to_cv2_image(img_bytes):
+    """將二進位資料轉為 OpenCV 格式圖片"""
+    if img_bytes is None:
+        return None
+    # 將 bytes 轉換為 numpy array
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    # 解碼為圖片
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    return img
+
+# ==========================================
+# 3. 主程式邏輯
+# ==========================================
+
+def main():
+    print("正在連線資料庫讀取圖片清單...")
+    image_ids = get_all_image_ids()
+    total_images = len(image_ids)
+    
+    if total_images == 0:
+        print("資料庫是空的，無法製作影片！")
+        return
+
+    print(f"共找到 {total_images} 張圖片，準備開始合成影片...")
+    print(f"預計影片長度: {total_images / FPS:.1f} 秒")
+
+    video_writer = None
+    frame_size = None
+
+    # 使用 tqdm 顯示進度條
+    for img_id in tqdm(image_ids, desc="Processing"):
+        # 1. 撈取並還原圖片
+        img_bytes = get_image_bytes(img_id)
+        img = bytes_to_cv2_image(img_bytes)
+
+        if img is None:
+            continue # 跳過壞掉的圖片
+
+        # 2. 初始化影片寫入器 (只做一次，根據第一張成功的圖片決定尺寸)
+        if video_writer is None:
+            height, width, layers = img.shape
+            frame_size = (width, height)
+            
+            # 設定編碼器 (mp4v 適合 MP4)
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(OUTPUT_FILENAME, fourcc, FPS, frame_size)
+            print(f"影片解析度設定為: {width}x{height}")
+
+        # 3. 安全檢查：確保每張圖尺寸一致 (如果不一致會導致影片損壞)
+        if (img.shape[1], img.shape[0]) != frame_size:
+            # 如果尺寸不對，強制縮放
+            img = cv2.resize(img, frame_size)
+
+        # 4. 寫入影格
+        video_writer.write(img)
+
+    # 5. 釋放資源
+    if video_writer:
+        video_writer.release()
+        print(f"\n✅ 縮時影片製作完成！檔案已儲存為: {OUTPUT_FILENAME}")
+    else:
+        print("\n❌ 製作失敗，沒有成功讀取到任何圖片。")
+
+if __name__ == "__main__":
+    main()
