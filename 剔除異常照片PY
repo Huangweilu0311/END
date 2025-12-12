@@ -1,0 +1,108 @@
+import cv2
+import os
+import pymysql
+from tqdm import tqdm
+
+# ==========================================
+# 1. 設定區域
+# ==========================================
+
+IMAGE_FOLDER = "downloaded_photos"
+OUTPUT_VIDEO = "final_timelapse_smart.mp4"
+FPS = 10 
+
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "123456",
+    "database": "cam_2025_12_12_START",
+    "autocommit": True
+}
+
+# ==========================================
+# 2. 資料庫連線
+# ==========================================
+
+def get_sorted_ids_from_db():
+    """從資料庫取得依照時間排序(sys_id)的所有 image_id"""
+    conn = pymysql.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cursor:
+            # 只抓 ID，且依照 sys_id (絕對時間軸) 排序
+            sql = "SELECT image_id FROM cam_info ORDER BY sys_id ASC"
+            cursor.execute(sql)
+            # 回傳一個 list: ['id1', 'id2', 'id3'...]
+            return [row[0] for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+# ==========================================
+# 3. 主程式
+# ==========================================
+
+def main():
+    if not os.path.exists(IMAGE_FOLDER):
+        print(f"找不到資料夾: {IMAGE_FOLDER}")
+        return
+
+    print("1. 正在讀取資料夾內剩餘的照片...")
+    # 取得資料夾內現存的所有檔名 (變成一個集合 set，搜尋速度快)
+    # 例如: {'abc_123.jpg', 'def_456.jpg'}
+    local_files = set(os.listdir(IMAGE_FOLDER))
+    
+    if len(local_files) == 0:
+        print("資料夾是空的！")
+        return
+
+    print("2. 正在向資料庫查詢正確的時間順序...")
+    sorted_all_ids = get_sorted_ids_from_db()
+    
+    print("3. 正在比對並建立製作清單...")
+    valid_ordered_files = []
+    
+    # 依照資料庫的順序，一個一個檢查
+    for img_id in sorted_all_ids:
+        filename = f"{img_id}.jpg"
+        
+        # 如果這個 ID 對應的檔案還在資料夾裡 (沒被你刪除)
+        if filename in local_files:
+            valid_ordered_files.append(filename)
+    
+    # 統計
+    total_db = len(sorted_all_ids)
+    total_local = len(local_files)
+    final_count = len(valid_ordered_files)
+    
+    print(f"------------------------------------------------")
+    print(f"資料庫總紀錄: {total_db} 張")
+    print(f"資料夾內剩餘: {total_local} 張 (你刪除了 {total_db - total_local} 張)")
+    print(f"最終合成數量: {final_count} 張 (依正確時間排序)")
+    print(f"------------------------------------------------")
+
+    # 4. 開始製作影片
+    # 讀取第一張圖來設定尺寸
+    first_img_path = os.path.join(IMAGE_FOLDER, valid_ordered_files[0])
+    img = cv2.imread(first_img_path)
+    height, width, layers = img.shape
+    frame_size = (width, height)
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, FPS, frame_size)
+
+    for filename in tqdm(valid_ordered_files, desc="Writing Video"):
+        path = os.path.join(IMAGE_FOLDER, filename)
+        img = cv2.imread(path)
+        
+        if img is None: continue
+        
+        # 尺寸防呆
+        if (img.shape[1], img.shape[0]) != frame_size:
+            img = cv2.resize(img, frame_size)
+            
+        video_writer.write(img)
+
+    video_writer.release()
+    print(f"\n✅ 影片製作完成！檔案: {OUTPUT_VIDEO}")
+
+if __name__ == "__main__":
+    main()
