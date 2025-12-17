@@ -1,0 +1,235 @@
+import sys
+import time
+import struct
+from datetime import datetime
+import pymysql
+import paho.mqtt.client as mqtt
+import math
+import numpy as np
+
+# PyQt6 模組
+from PyQt6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QPushButton, QLabel, QHBoxLayout
+from PyQt6.QtCore import QTimer, QThread, pyqtSignal
+from PyQt6.QtGui import QFont
+import pyqtgraph as pg
+
+# ================= 設定區域 =================
+# 1. 資料庫設定
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': '123456', 
+    'database': 'signal_db',
+    'charset': 'utf8mb4',
+    'cursorclass': pymysql.cursors.DictCursor
+}
+TABLE_NAME = "adc_data_sin_esp32"
+
+# 2. MQTT 設定
+MQTT_BROKER = "192.168.1.24"
+MQTT_PORT = 1883
+MQTT_TOPIC = "LS_Lab/sensor/adc/binary"
+
+# 3. 數據解碼設定
+STRUCT_FORMAT = '<iQ'
+SAMPLE_SIZE = 12
+
+# 4. 繪圖視窗設定
+DATA_WINDOW_SIZE = 50 
+
+# 5. 斷線判定閾值 (秒)
+GAP_THRESHOLD = 0.2 
+
+# ================= 資料庫寫入函式 =================
+def get_db_connection():
+    try:
+        return pymysql.connect(**DB_CONFIG)
+    except pymysql.MySQLError as err:
+        print(f"DB Error: {err}")
+        return None
+
+def save_to_mysql(samples_list):
+    conn = get_db_connection()
+    if conn is None: return
+    try:
+        with conn.cursor() as cursor:
+            sql = f"INSERT INTO {TABLE_NAME} (timestamp_micros, voltage) VALUES (%s, %s)"
+            data_to_insert = []
+            for raw_diff, raw_timestamp in samples_list:
+                voltage = raw_diff / 10000.0 
+                data_to_insert.append((raw_timestamp, voltage))
+            cursor.executemany(sql, data_to_insert)
+            conn.commit()
+    except pymysql.MySQLError as err:
+        print(f"資料庫寫入失敗: {err}")
+    finally:
+        conn.close()
+
+# ================= MQTT 背景執行緒 =================
+class MqttWorker(QThread):
+    data_received = pyqtSignal(str) 
+
+    def run(self):
+        self.client = mqtt.Client()
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+        try:
+            self.client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            self.client.loop_forever()
+        except Exception as e:
+            print(f"MQTT 連線錯誤: {e}")
+
+    def on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            client.subscribe(MQTT_TOPIC)
+            self.data_received.emit(f"MQTT 連線成功 ({MQTT_BROKER})")
+
+    def on_message(self, client, userdata, msg):
+        payload = msg.payload
+        if len(payload) % SAMPLE_SIZE != 0: return
+        try:
+            samples = list(struct.iter_unpack(STRUCT_FORMAT, payload))
+            save_to_mysql(samples)
+            raw_diff, _ = samples[0]
+            vol = raw_diff / 10000.0
+            self.data_received.emit(f"接收中... 最新: {vol:.4f} V")
+        except Exception as e:
+            print(f"解碼錯誤: {e}")
+
+# ================= UI 介面設定 =================
+class TimeAxisItem(pg.AxisItem):
+    """自定義時間軸：僅顯示秒與毫秒，並移除自動縮放標籤"""
+    def tickStrings(self, values, scale, spacing):
+        # 使用 datetime 轉換，確保格式為 秒.毫秒
+        return [datetime.fromtimestamp(value).strftime("%S.%f")[:-3] for value in values]
+
+class ADCSystemApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ESP32 ADC 監控系統 (修正時間格式)")
+        self.resize(1200, 750)
+
+        # 啟動 MQTT
+        self.mqtt_thread = MqttWorker()
+        self.mqtt_thread.data_received.connect(self.update_mqtt_status)
+        self.mqtt_thread.start()
+
+        self.main_widget = QWidget()
+        self.setCentralWidget(self.main_widget)
+        self.layout = QVBoxLayout()
+        self.main_widget.setLayout(self.layout)
+
+        # 繪圖設定
+        pg.setConfigOption('background', 'w')
+        pg.setConfigOption('foreground', 'k')
+        pg.setConfigOption('antialias', True) 
+        
+        date_axis = TimeAxisItem(orientation='bottom')
+        
+        # ★★★ 關鍵修正：禁用自動科學記號標籤 (x1e+09) ★★★
+        date_axis.enableAutoSIPrefix(False) 
+        
+        self.plot_widget = pg.PlotWidget(axisItems={'bottom': date_axis})
+        
+        # 設定標籤
+        label_style = {'font-size': '25pt'}
+        self.plot_widget.setLabel('left', '電壓 ', units='V', **label_style)
+        self.plot_widget.setLabel('bottom', '時間(s)', **label_style)
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        
+        # 調整座標數字大小
+        tick_font = QFont('Arial', 25)
+        self.plot_widget.getAxis('left').setTickFont(tick_font)
+        
+        ax_bottom = self.plot_widget.getAxis('bottom')
+        ax_bottom.setTickFont(tick_font)
+        ax_bottom.setHeight(70) 
+
+        # 建立線條
+        self.data_line = self.plot_widget.plot(
+            name="ADC 訊號", 
+            pen=pg.mkPen(color='#1f77b4', width=5)
+        )
+
+        # 狀態列
+        self.status_layout = QHBoxLayout()
+        self.lbl_mqtt_status = QLabel("MQTT: 等待連線...")
+        self.lbl_mqtt_status.setStyleSheet("font-weight: bold; color: blue; font-size: 16px;")
+        self.lbl_plot_status = QLabel("圖表: 初始化...")
+        self.lbl_plot_status.setStyleSheet("font-size: 16px;")
+        
+        self.btn_pause = QPushButton("暫停圖表更新")
+        self.btn_pause.setCheckable(True)
+        self.btn_pause.clicked.connect(self.toggle_plot)
+
+        self.status_layout.addWidget(self.lbl_mqtt_status)
+        self.status_layout.addStretch()
+        self.status_layout.addWidget(self.lbl_plot_status)
+        self.status_layout.addWidget(self.btn_pause)
+
+        self.layout.addWidget(self.plot_widget)
+        self.layout.addLayout(self.status_layout)
+
+        self.plot_timer = QTimer()
+        self.plot_timer.timeout.connect(self.refresh_plot)
+        self.plot_timer.start(100) 
+
+    def update_mqtt_status(self, msg):
+        self.lbl_mqtt_status.setText(msg)
+
+    def toggle_plot(self):
+        if self.btn_pause.isChecked():
+            self.plot_timer.stop()
+            self.btn_pause.setText("恢復圖表更新")
+        else:
+            self.plot_timer.start(100)
+            self.btn_pause.setText("暫停圖表更新")
+
+    def refresh_plot(self):
+        try:
+            conn = pymysql.connect(**DB_CONFIG)
+            with conn.cursor() as cursor:
+                sql = f"SELECT timestamp_micros, voltage FROM {TABLE_NAME} ORDER BY id DESC LIMIT {DATA_WINDOW_SIZE}"
+                cursor.execute(sql)
+                results = cursor.fetchall()
+                results.reverse()
+            conn.close()
+
+            if not results: return
+
+            plot_x = []
+            plot_y = []
+
+            for i in range(len(results)):
+                current_ts = results[i]['timestamp_micros'] / 1_000_000.0
+                current_vol = results[i]['voltage']
+
+                if i > 0:
+                    prev_ts = results[i-1]['timestamp_micros'] / 1_000_000.0
+                    if (current_ts - prev_ts) > GAP_THRESHOLD:
+                        plot_x.append(current_ts)   
+                        plot_y.append(float('nan'))
+
+                plot_x.append(current_ts)
+                plot_y.append(current_vol)
+
+            self.data_line.setData(plot_x, plot_y, connect='finite')
+
+            valid_vols = [v for v in plot_y if not math.isnan(v)]
+            if valid_vols:
+                self.lbl_plot_status.setText(f"最新電壓: {valid_vols[-1]:.4f} V")
+
+        except Exception as e:
+            print(f"刷新繪圖錯誤: {e}")
+
+    def closeEvent(self, event):
+        if self.mqtt_thread.isRunning():
+            self.mqtt_thread.terminate()
+            self.mqtt_thread.wait()
+        event.accept()
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = ADCSystemApp()
+    window.show()
+    sys.exit(app.exec())
