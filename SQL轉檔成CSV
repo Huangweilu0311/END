@@ -1,0 +1,74 @@
+import pandas as pd
+from sqlalchemy import create_engine
+
+# ================= 設定區 =================
+# 資料庫連線設定
+db_config = {
+    'user': 'root',           # 您的 MySQL 帳號
+    'password': '123456',   # 您的 MySQL 密碼
+    'host': 'localhost',      # 資料庫位址 (如果是本機就用 localhost 或 127.0.0.1)
+    'port': 3306,             # MySQL Port
+    'database': 'signal_db'   # 您的資料庫名稱 (請確認名稱是否正確)
+}
+
+# 要輸出的資料表名稱列表
+tables = [
+    'adc_data_sin_1',
+    'adc_data_sin_100',
+    'adc_data_sin_esp32'
+]
+
+# 設定要取出的筆數
+LIMIT_COUNT = 50
+# =========================================
+
+def export_tables():
+    # 建立資料庫連線字串 (使用 SQLAlchemy)
+    # 格式: mysql+pymysql://user:password@host:port/database
+    db_url = f"mysql+pymysql://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}"
+    
+    try:
+        engine = create_engine(db_url)
+        print("資料庫連線成功！開始匯出...\n")
+
+        for table in tables:
+            print(f"正在處理表格: {table} ...")
+            
+            # SQL 邏輯：
+            # 1. ORDER BY id DESC -> 依照 ID 倒敘，這樣最上面的就是最新的數據
+            # 2. LIMIT 1000 -> 只拿最新的 1000 筆
+            query = f"""
+            SELECT timestamp_micros, voltage 
+            FROM {table} 
+            ORDER BY id DESC 
+            LIMIT {LIMIT_COUNT};
+            """
+            
+            # 使用 pandas 讀取 SQL
+            df = pd.read_sql(query, engine)
+            
+            if df.empty:
+                print(f"  警告: 表格 {table} 是空的，跳過。")
+                continue
+
+            # ★ 重要步驟：重新排序 ★
+            # 因為剛才是用 DESC (倒敘) 拿資料，現在要轉回 ASC (正序/時間順序)
+            # 這樣畫圖時，線條才會從左畫到右
+            df.sort_values(by='timestamp_micros', ascending=True, inplace=True)
+            
+            # 輸出 CSV
+            # index=False: 不要把 pandas 的索引數字存進去
+            # header=False: 配合您之前的繪圖程式 (如果不想要標題列)
+            # 如果想要標題列，請改為 header=True
+            output_filename = f"{table}.csv"
+            df.to_csv(output_filename, index=False, header=False)
+            
+            print(f"  -> 已儲存為: {output_filename} ({len(df)} 筆)")
+
+        print("\n所有作業完成！")
+
+    except Exception as e:
+        print(f"發生錯誤: {e}")
+
+if __name__ == "__main__":
+    export_tables()
