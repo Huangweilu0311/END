@@ -1,0 +1,176 @@
+import sys
+import os
+import pandas as pd
+import numpy as np
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
+                             QWidget, QPushButton, QFileDialog, QLabel, QMessageBox, QLineEdit)
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont
+import pyqtgraph as pg
+
+# 設定背景為白色，線條為黑色
+pg.setConfigOption('background', 'w')
+pg.setConfigOption('foreground', 'k')
+pg.setConfigOption('antialias', True) 
+
+class ADCViewer(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("ADC Data Viewer - Locked 0-0.3s Scale")
+        self.resize(1200, 800)
+
+        # --- 資料儲存區 ---
+        self.loaded_datasets = []
+        self.colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+
+        # --- 介面佈局 ---
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        self.status_label = QLabel("請輸入名稱並加入 CSV (視窗將鎖定 0~0.3s)")
+        self.status_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #333;")
+        main_layout.addWidget(self.status_label)
+
+        # 自定義名稱輸入區
+        input_layout = QHBoxLayout()
+        name_label = QLabel("自定義線段名稱:")
+        name_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("在此輸入名稱")
+        self.name_input.setStyleSheet("font-size: 20px; padding: 8px;")
+        input_layout.addWidget(name_label)
+        input_layout.addWidget(self.name_input)
+        main_layout.addLayout(input_layout)
+
+        button_layout = QHBoxLayout()
+        self.btn_add = QPushButton("➕ 加入 CSV 檔案")
+        self.btn_add.setStyleSheet("font-size: 18px; padding: 12px; background-color: #e1f5fe; font-weight: bold;")
+        self.btn_add.clicked.connect(self.add_file)
+        
+        self.btn_clear = QPushButton("🗑️ 清除所有資料")
+        self.btn_clear.setStyleSheet("font-size: 18px; padding: 12px; background-color: #ffebee; font-weight: bold;")
+        self.btn_clear.clicked.connect(self.clear_all_data)
+        
+        button_layout.addWidget(self.btn_add)
+        button_layout.addWidget(self.btn_clear)
+        main_layout.addLayout(button_layout)
+
+        # --- 繪圖區域 ---
+        self.plot_widget = pg.PlotWidget()
+        main_layout.addWidget(self.plot_widget)
+
+        # 座標軸字體與間距設定
+        tick_font = QFont('Arial')
+        tick_font.setPixelSize(25) 
+        label_style = {'font-size': '22pt', 'font-family': 'Arial'}
+
+        left_axis = self.plot_widget.getAxis('left')
+        left_axis.setTickFont(tick_font)
+        left_axis.setWidth(130) # 解決大字體重疊
+        left_axis.enableAutoSIPrefix(False) 
+        self.plot_widget.setLabel('left', 'Voltage (V)', **label_style)
+
+        bottom_axis = self.plot_widget.getAxis('bottom')
+        bottom_axis.setTickFont(tick_font)
+        bottom_axis.setHeight(90)
+        bottom_axis.enableAutoSIPrefix(False) 
+        self.plot_widget.setLabel('bottom', 'Time (s)', **label_style)
+
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.legend = self.plot_widget.addLegend(offset=(10, 10), labelTextSize='18pt')
+
+        # --- ★ 核心修正：固定視窗範圍為 0 到 0.3S ★ ---
+        # 1. 設定初始顯示範圍
+        self.plot_widget.setXRange(0, 0.05, padding=0)
+        # 2. 設定限制，不讓使用者縮放超過此範圍 (選用，如果您希望完全鎖死)
+        self.plot_widget.setLimits(xMin=0, xMax=0.05)
+        # 3. 禁用滑鼠滾輪縮放與右鍵縮放 X 軸 (確保視角不動)
+        self.plot_widget.setMouseEnabled(x=False, y=True) 
+
+        # 十字游標
+        self.vLine = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('r', width=1, style=Qt.PenStyle.DashLine))
+        self.hLine = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('r', width=1, style=Qt.PenStyle.DashLine))
+        self.vLine.setVisible(False)
+        self.hLine.setVisible(False)
+        self.plot_widget.addItem(self.vLine, ignoreBounds=True)
+        self.plot_widget.addItem(self.hLine, ignoreBounds=True)
+        
+        self.proxy = pg.SignalProxy(self.plot_widget.scene().sigMouseMoved, rateLimit=60, slot=self.mouse_moved)
+
+    def add_file(self):
+        file_name, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv *.txt);;All Files (*)")
+        if file_name:
+            try:
+                df = pd.read_csv(file_name, header=None, usecols=[0, 1])
+                df = df.apply(pd.to_numeric, errors='coerce').dropna()
+                t_data = df.iloc[:, 0].values
+                v_data = df.iloc[:, 1].values
+
+                # 時間處理：強制歸零從 0 開始
+                t_data = (t_data - t_data[0])
+                if np.max(np.abs(t_data)) > 10000: # 如果是微秒則轉秒
+                    t_data = t_data / 1000000.0
+
+                custom_name = self.name_input.text().strip()
+                display_name = custom_name if custom_name else os.path.basename(file_name)
+
+                self.loaded_datasets.append({
+                    't': t_data,
+                    'v': v_data,
+                    'name': display_name
+                })
+
+                self.refresh_plot()
+                self.name_input.clear()
+
+            except Exception as e:
+                QMessageBox.critical(self, "錯誤", f"讀取失敗: {str(e)}")
+
+    def clear_all_data(self):
+        self.loaded_datasets = []
+        self.refresh_plot()
+
+    def refresh_plot(self):
+        self.plot_widget.clear()
+        self.legend.clear() 
+        self.plot_widget.addItem(self.vLine, ignoreBounds=True)
+        self.plot_widget.addItem(self.hLine, ignoreBounds=True)
+
+        if not self.loaded_datasets:
+            self.vLine.setVisible(False)
+            self.hLine.setVisible(False)
+            return
+
+        self.vLine.setVisible(True)
+        self.hLine.setVisible(True)
+
+        for i, data in enumerate(self.loaded_datasets):
+            color = self.colors[i % len(self.colors)]
+            self.plot_widget.plot(
+                data['t'], 
+                data['v'], 
+                pen=pg.mkPen(color=color, width=5), 
+                name=data['name']
+            )
+            
+        # 每次刷新都重新強制鎖定在 0 到 0.3
+        self.plot_widget.setXRange(0, 0.3, padding=0)
+
+    def mouse_moved(self, evt):
+        pos = evt[0]
+        if self.plot_widget.sceneBoundingRect().contains(pos):
+            mousePoint = self.plot_widget.plotItem.vb.mapSceneToView(pos)
+            self.vLine.setPos(mousePoint.x())
+            self.hLine.setPos(mousePoint.y())
+            self.plot_widget.setTitle(
+                f"<span style='font-size: 18pt; color: #1f77b4'>Time: {mousePoint.x():.6f} s</span> | "
+                f"<span style='font-size: 18pt; color: #d62728'>Value: {mousePoint.y():.6f}</span>"
+            )
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = ADCViewer()
+    window.show()
+    sys.exit(app.exec())
